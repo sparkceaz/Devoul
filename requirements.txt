@@ -1,0 +1,8 @@
+aiogram
+aiohttp
+apscheduler
+google-genai
+openai
+python-telegram-bot
+pytz
+aiosqlite
