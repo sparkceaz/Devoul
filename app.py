@@ -10,9 +10,19 @@ Single-user Telegram bot that scans prematch football odds in a rolling
   * Pinnacle  -> oddspapi.io  (unchanged behaviour)
   * SportyBet -> its own public factsCenter API (derived from the HAR capture)
 
-All configuration lives in a single JSON file (devoul_variable.json) - there
-are NO environment variables required.  The database is Supabase (Postgres)
-accessed over PostgREST with the service-role key.
+All configuration is read from ENVIRONMENT VARIABLES (see devoul_variables.env)
+- there is NO config file.  Load devoul_variables.env into the process
+environment (Railway Variables, or `set -a; . ./devoul_variables.env` locally).
+
+The database is Supabase (Postgres) accessed over PostgREST:
+  * SUPABASE_URL                      - project URL
+  * SUPABASE_SERVICE_ROLE_KEY         - legacy JWT role key (kept for parity)
+  * SUPABASE_SECRET_KEYS              - sb_secret_... key, USED FOR POSTGREST READS/WRITES
+  * SUPABASE_PUBLISHABLE_KEYS         - sb_publishable_... key
+  * SUPABASE_ANON_KEY                 - anon JWT (public client parity)
+
+NOTE: PostgREST requires the SECRET key; the publishable key returns
+"Secret API key required" (401), so SUPABASE_SECRET_KEYS is what the bot uses.
 
 Deploy target: Railway (see DEPLOY-RAILWAY.md).
 """
@@ -50,17 +60,90 @@ from google import genai
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
-# CONFIG  (single JSON file - no env vars)
+# CONFIG  (environment variables only - no config file)
 # ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(_HERE, "devoul_variable.json")
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
-    CFG = json.load(_f)
+
+def _load_dotenv(path):
+    """Load KEY="value" lines from an optional .env file into os.environ.
+
+    Real environment variables ALWAYS win (Railway Variables / shell exports),
+    so this is only a local-convenience fallback.  Quotes are stripped exactly
+    the way systemd/dotenv do it.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_load_dotenv(os.path.join(_HERE, "devoul_variables.env"))
 
 
 def _cfg(key, default=None):
-    return CFG.get(key, default)
+    """Read a config value from the environment."""
+    val = os.environ.get(key)
+    if val is None or val == "":
+        return default
+    return val
+
+
+def _cfg_int(key, default):
+    try:
+        return int(str(_cfg(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _cfg_float(key, default):
+    try:
+        return float(str(_cfg(key, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _cfg_list(key, default=None):
+    """Parse a comma-separated env value into a list of stripped strings."""
+    raw = _cfg(key)
+    if raw is None:
+        return list(default or [])
+    items = [x.strip() for x in str(raw).split(",")]
+    return [x for x in items if x] or list(default or [])
+
+
+def _cfg_json(key, default):
+    """Parse a JSON-encoded env value (used for id->label maps)."""
+    raw = _cfg(key)
+    if raw is None:
+        return json.loads(json.dumps(default))
+    return json.loads(raw)
+
+
+# --- Secrets MUST come from the environment ---------------------------------
+_REQUIRED_ENV = ("TELEGRAM_BOT_TOKEN", "ADMIN_ID")
+_missing_env = [k for k in _REQUIRED_ENV if not _cfg(k)]
+
+if _missing_env:
+    raise SystemExit(
+        "Devoul Bot cannot start: missing required environment variable(s): "
+        + ", ".join(_missing_env)
+        + ".  Load devoul_variables.env or set them in the Railway dashboard."
+    )
 
 
 logging.basicConfig(
@@ -71,14 +154,24 @@ logger = logging.getLogger("devoul")
 
 # --- Telegram ---------------------------------------------------------------
 TOKEN = _cfg("TELEGRAM_BOT_TOKEN") or _cfg("TOKEN")
-ADMIN_ID = int(_cfg("ADMIN_ID"))
+ADMIN_ID = _cfg_int("ADMIN_ID", 0)
 BOT_USERNAME = _cfg("BOT_USERNAME", "devoulbot")
 ACCESS_DENIED_URL = _cfg("ACCESS_DENIED_URL", "https://t.me/sparkcea")
 ACCESS_DENIED_CONTACT = _cfg("ACCESS_DENIED_CONTACT", "sparkcea")
 
 # --- Supabase ---------------------------------------------------------------
 SUPABASE_URL = _cfg("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = _cfg("SUPABASE_SERVICE_ROLE_KEY")
+# PostgREST needs the SECRET key: the publishable key is rejected with
+# "Secret API key required".  Fall back to the legacy service-role JWT.
+SUPABASE_SECRET_KEY = (
+    _cfg("SUPABASE_SECRET_KEYS")
+    or _cfg("SUPABASE_SERVICE_ROLE_KEY")
+    or _cfg("SUPABASE_SERVICE_KEY")
+)
+# Kept for parity / any client-side use; not used against PostgREST.
+SUPABASE_PUBLISHABLE_KEY = _cfg("SUPABASE_PUBLISHABLE_KEYS") or _cfg("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = _cfg("SUPABASE_SERVICE_ROLE_KEY") or SUPABASE_SECRET_KEY
+SUPABASE_ANON_KEY = _cfg("SUPABASE_ANON_KEY")
 
 # --- Pinnacle (oddspapi) ----------------------------------------------------
 ODDSPAPI_KEY = _cfg("ODDSPAPI_KEY")
@@ -86,13 +179,13 @@ ODDSPAPI_BASE = _cfg("ODDSPAPI_BASE", "https://api.oddspapi.io")
 
 # --- SportyBet --------------------------------------------------------------
 SB_BASE = _cfg("SPORTYBET_BASE", "https://www.sportybet.com/api/ng/factsCenter")
-SB_PRODUCT_ID = _cfg("SPORTYBET_PRODUCT_ID", 3)
+SB_PRODUCT_ID = _cfg_int("SPORTYBET_PRODUCT_ID", 3)
 SB_SPORT_ID = _cfg("SPORTYBET_SPORT_ID", "sr:sport:1")
-SB_PAGE_SIZE = int(_cfg("SPORTYBET_PAGE_SIZE", 100))
-SB_MAX_PAGES = int(_cfg("SPORTYBET_MAX_PAGES", 60))
-SB_TIMELINE_HOURS = int(_cfg("SPORTYBET_TIMELINE_HOURS", 24))
-SB_OUTCOMES_BATCH = int(_cfg("SPORTYBET_OUTCOMES_BATCH", 600))
-SB_DELAY = float(_cfg("SPORTYBET_REQUEST_DELAY_SEC", 0.35))
+SB_PAGE_SIZE = _cfg_int("SPORTYBET_PAGE_SIZE", 100)
+SB_MAX_PAGES = _cfg_int("SPORTYBET_MAX_PAGES", 60)
+SB_TIMELINE_HOURS = _cfg_int("SPORTYBET_TIMELINE_HOURS", 24)
+SB_OUTCOMES_BATCH = _cfg_int("SPORTYBET_OUTCOMES_BATCH", 600)
+SB_DELAY = _cfg_float("SPORTYBET_REQUEST_DELAY_SEC", 0.35)
 SB_EVENTS_PATH = _cfg("SPORTYBET_EVENTS_PATH", "/wapConfigurableEventsByOrder")
 SB_OUTCOMES_PATH = _cfg("SPORTYBET_OUTCOMES_PATH", "/Outcomes")
 SB_BANNED_PATH = _cfg("SPORTYBET_BANNED_EVENTS_PATH", "/banned/events")
@@ -113,29 +206,30 @@ SB_O_UNDER25 = str(_cfg("SPORTYBET_OUTCOME_UNDER25", "13"))
 SB_O_BTTS_YES = str(_cfg("SPORTYBET_OUTCOME_BTTS_YES", "74"))
 SB_O_BTTS_NO = str(_cfg("SPORTYBET_OUTCOME_BTTS_NO", "76"))
 
-SB_CS_OUTCOMES = {str(k): v for k, v in _cfg("SPORTYBET_CS_OUTCOMES", {}).items()}
-SB_HT_CS_OUTCOMES = {str(k): v for k, v in _cfg("SPORTYBET_HT_CS_OUTCOMES", {}).items()}
-SB_CS_IDS = [str(x) for x in _cfg("SPORTYBET_CS_IDS", list(SB_CS_OUTCOMES.keys()))]
-SB_HT_CS_IDS = [str(x) for x in _cfg("SPORTYBET_HT_CS_IDS", list(SB_HT_CS_OUTCOMES.keys()))]
+SB_CS_OUTCOMES = {str(k): v for k, v in _cfg_json("SPORTYBET_CS_OUTCOMES", {}).items()}
+SB_HT_CS_OUTCOMES = {str(k): v for k, v in _cfg_json("SPORTYBET_HT_CS_OUTCOMES", {}).items()}
+SB_CS_IDS = [str(x) for x in _cfg_list("SPORTYBET_CS_IDS", list(SB_CS_OUTCOMES.keys()))]
+SB_HT_CS_IDS = [str(x) for x in _cfg_list("SPORTYBET_HT_CS_IDS", list(SB_HT_CS_OUTCOMES.keys()))]
 
 # --- Analysis thresholds ----------------------------------------------------
-SCAN_WINDOW_HOURS = int(_cfg("SCAN_WINDOW_HOURS", 24))
-MAX_MINUTES_TO_KICKOFF = int(_cfg("MAX_MINUTES_TO_KICKOFF", 1440))
-MIN_ODDS = float(_cfg("MIN_ODDS", 1.25))
-MAX_INITIAL_ODDS_D = float(_cfg("MAX_INITIAL_ODDS_D", 1.81))
-MAX_INITIAL_ODDS_FT_DRAW = float(_cfg("MAX_INITIAL_ODDS_FT_DRAW", 4.0))
-MAX_INITIAL_ODDS_HT_DRAW = float(_cfg("MAX_INITIAL_ODDS_HT_DRAW", 2.2))
-MIN_DROP_PCT = float(_cfg("MIN_DROP_PCT", 0.5))
-D_ANALYSIS_MIN_DROP_PCT = float(_cfg("D_ANALYSIS_MIN_DROP_PCT", 10))
-CS_MIN_DROP_PCT = float(_cfg("CS_MIN_DROP_PCT", 12))
-FT_DRAW_MIN_DROP_PCT = float(_cfg("FT_DRAW_MIN_DROP_PCT", 12))
-HT_DRAW_MIN_DROP_PCT = float(_cfg("HT_DRAW_MIN_DROP_PCT", 3))
-SB_FT_DRAW_MIN_DROP_PCT = float(_cfg("SPORTYBET_FT_DRAW_MIN_DROP_PCT", 6))
+SCAN_WINDOW_HOURS = _cfg_int("SCAN_WINDOW_HOURS", 24)
+MAX_MINUTES_TO_KICKOFF = _cfg_int("MAX_MINUTES_TO_KICKOFF", 1440)
+MIN_ODDS = _cfg_float("MIN_ODDS", 1.25)
+MAX_INITIAL_ODDS_D = _cfg_float("MAX_INITIAL_ODDS_D", 1.81)
+MAX_INITIAL_ODDS_FT_DRAW = _cfg_float("MAX_INITIAL_ODDS_FT_DRAW", 4.0)
+MAX_INITIAL_ODDS_HT_DRAW = _cfg_float("MAX_INITIAL_ODDS_HT_DRAW", 2.2)
+MIN_DROP_PCT = _cfg_float("MIN_DROP_PCT", 0.5)
+D_ANALYSIS_MIN_DROP_PCT = _cfg_float("D_ANALYSIS_MIN_DROP_PCT", 10)
+CS_MIN_DROP_PCT = _cfg_float("CS_MIN_DROP_PCT", 12)
+FT_DRAW_MIN_DROP_PCT = _cfg_float("FT_DRAW_MIN_DROP_PCT", 12)
+HT_DRAW_MIN_DROP_PCT = _cfg_float("HT_DRAW_MIN_DROP_PCT", 3)
+SB_FT_DRAW_MIN_DROP_PCT = _cfg_float("SPORTYBET_FT_DRAW_MIN_DROP_PCT", 6)
 
-EXCLUDED_KEYWORDS = [k.lower() for k in _cfg("EXCLUDED_LEAGUE_KEYWORDS", [])]
+EXCLUDED_KEYWORDS = [k.lower() for k in _cfg_list("EXCLUDED_LEAGUE_KEYWORDS", [])]
 LAGOS = pytz.timezone(_cfg("TIMEZONE", "Africa/Lagos"))
-CACHE_KEEP_ROWS = int(_cfg("CACHE_KEEP_ROWS", 50))
-SCAN_SCHEDULE = _cfg("SCAN_SCHEDULE", [])
+CACHE_KEEP_ROWS = _cfg_int("CACHE_KEEP_ROWS", 50)
+CLEANUP_RETENTION_DAYS = _cfg_int("CLEANUP_RETENTION_DAYS", 7)
+SCAN_SCHEDULE = _cfg_json("SCAN_SCHEDULE", [])
 
 # Pinnacle market ids (loaded at startup from oddspapi)
 MARKET_H2H = None
@@ -262,7 +356,7 @@ class Supabase:
             await self._session.close()
 
 
-DB = Supabase(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+DB = Supabase(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
 async def db_get_setting(key, default=None):
