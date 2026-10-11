@@ -201,11 +201,15 @@ ODDSPAPI_BASE = _cfg("ODDSPAPI_BASE", "https://api.oddspapi.io")
 SB_BASE = _cfg("SPORTYBET_BASE", "https://www.sportybet.com/api/ng/factsCenter")
 SB_PRODUCT_ID = _cfg_int("SPORTYBET_PRODUCT_ID", 3)
 SB_SPORT_ID = _cfg("SPORTYBET_SPORT_ID", "sr:sport:1")
-SB_PAGE_SIZE = _cfg_int("SPORTYBET_PAGE_SIZE", 100)
+SB_PAGE_SIZE = _cfg_int("SPORTYBET_PAGE_SIZE", 200)
 SB_MAX_PAGES = _cfg_int("SPORTYBET_MAX_PAGES", 60)
 SB_TIMELINE_HOURS = _cfg_int("SPORTYBET_TIMELINE_HOURS", 24)
-SB_OUTCOMES_BATCH = _cfg_int("SPORTYBET_OUTCOMES_BATCH", 600)
-SB_DELAY = _cfg_float("SPORTYBET_REQUEST_DELAY_SEC", 0.35)
+SB_OUTCOMES_BATCH = _cfg_int("SPORTYBET_OUTCOMES_BATCH", 900)
+SB_DELAY = _cfg_float("SPORTYBET_REQUEST_DELAY_SEC", 0.15)
+# Bulk transport: how many page/Outcomes requests may be in flight at once.
+SB_CONCURRENCY = _cfg_int("SPORTYBET_CONCURRENCY", 8)
+# Prematch look-back for the first-scan comparison, matching Pinnacle's 720 min.
+SCAN_WINDOW_MINUTES = _cfg_int("SCAN_WINDOW_MINUTES", 720)
 SB_EVENTS_PATH = _cfg("SPORTYBET_EVENTS_PATH", "/wapConfigurableEventsByOrder")
 SB_OUTCOMES_PATH = _cfg("SPORTYBET_OUTCOMES_PATH", "/Outcomes")
 SB_BANNED_PATH = _cfg("SPORTYBET_BANNED_EVENTS_PATH", "/banned/events")
@@ -230,6 +234,13 @@ SB_CS_OUTCOMES = {str(k): v for k, v in _cfg_json("SPORTYBET_CS_OUTCOMES", {}).i
 SB_HT_CS_OUTCOMES = {str(k): v for k, v in _cfg_json("SPORTYBET_HT_CS_OUTCOMES", {}).items()}
 SB_CS_IDS = [str(x) for x in _cfg_list("SPORTYBET_CS_IDS", list(SB_CS_OUTCOMES.keys()))]
 SB_HT_CS_IDS = [str(x) for x in _cfg_list("SPORTYBET_HT_CS_IDS", list(SB_HT_CS_OUTCOMES.keys()))]
+
+# The market ids that may need the bulk /Outcomes endpoint.  Only the two
+# correct-score markets ever go through it: 1X2 / OU2.5 / BTTS / HT 1X2 already
+# arrive inline in the events-list payload, so the expensive part of the scan is
+# confined to the outcome lookups for the two score markets.
+SB_OUTCOME_MARKETS = [str(_cfg("SPORTYBET_MARKET_CS", "45")),
+                      str(_cfg("SPORTYBET_MARKET_HT_CS", "81"))]
 
 # --- Analysis thresholds ----------------------------------------------------
 SCAN_WINDOW_HOURS = _cfg_int("SCAN_WINDOW_HOURS", 24)
@@ -527,6 +538,8 @@ class SportyBet:
 
     def __init__(self):
         self._session = None
+        self.requests_made = 0
+        self.outcome_requests = 0
 
     async def _sess(self):
         if self._session is None or self._session.closed:
@@ -547,7 +560,7 @@ class SportyBet:
             "referer": _cfg("SPORTYBET_REFERER", "https://www.sportybet.com/ng/m/sport/football"),
         }
 
-    async def _request(self, method, path, body=None, params=None, attempts=4):
+    async def _request(self, method, path, body=None, params=None, attempts=3):
         """HTTP with retry/backoff.
 
         NOTE: SportyBet sits behind AWS WAF, which issues a JS "challenge"
@@ -571,7 +584,7 @@ class SportyBet:
                     return json.loads(text)
                 last = status
                 if status in (202, 429) or status >= 500:
-                    await asyncio.sleep(1.5 * (i + 1))
+                    await asyncio.sleep(1.0 * (i + 1))
                     continue
                 logger.warning("sportybet %s -> HTTP %s", path, status)
                 return None
@@ -587,40 +600,84 @@ class SportyBet:
     async def _get(self, path, params=None):
         return await self._request("GET", path, params=params)
 
+    async def _events_page(self, page):
+        """One bulk page of the prematch football list."""
+        body = {
+            "timeline": SB_TIMELINE_HOURS,
+            "productId": SB_PRODUCT_ID,
+            "sportId": SB_SPORT_ID,
+            "order": 0,
+            "pageNum": page,
+            "pageSize": SB_PAGE_SIZE,
+            "withTwoUpMarket": True,
+            "withOneUpMarket": True,
+        }
+        data = await self._post(SB_EVENTS_PATH, body)
+        if not data or data.get("bizCode") != 10000:
+            return None
+        d = data.get("data") or {}
+        tours = d.get("tournaments") or []
+        return d, [e for t in tours for e in (t.get("events") or [])]
+
     async def fetch_all_events(self):
-        """Paginate the prematch football list for the 24h window."""
-        events = []
-        seen = set()
-        page = 1
-        while page <= SB_MAX_PAGES:
-            body = {
-                "timeline": SB_TIMELINE_HOURS,
-                "productId": SB_PRODUCT_ID,
-                "sportId": SB_SPORT_ID,
-                "order": 0,
-                "pageNum": page,
-                "pageSize": SB_PAGE_SIZE,
-                "withTwoUpMarket": True,
-                "withOneUpMarket": True,
-            }
-            data = await self._post(SB_EVENTS_PATH, body)
-            if not data or data.get("bizCode") != 10000:
+        """BULK fetch of the prematch football list for the 24h window.
+
+        Uses the SAME bulk pattern as Pinnacle: a small number of batched
+        requests processed together, fanned out concurrently with a bounded
+        semaphore - not one request per match.  The first page is probed to
+        learn `moreEvents`; the remaining pages are then fetched in parallel
+        waves, and a wave that returns an empty page ends the walk.
+        """
+        events, seen = [], set()
+        self.requests_made = 0
+
+        first = await self._events_page(1)
+        self.requests_made += 1
+        if not first:
+            logger.info("SportyBet: no events page 1")
+            return events
+
+        d1, page1 = first
+        for e in page1:
+            eid = e.get("eventId")
+            if eid and eid not in seen:
+                seen.add(eid)
+                events.append(e)
+        if not d1.get("moreEvents"):
+            logger.info("SportyBet: fetched %s prematch events in %s bulk requests", len(events), self.requests_made)
+            return events
+
+        sem = asyncio.Semaphore(max(1, SB_CONCURRENCY))
+        pages = 2
+        while pages <= SB_MAX_PAGES:
+            wave = list(range(pages, min(pages + SB_CONCURRENCY, SB_MAX_PAGES + 1)))
+            if not wave:
                 break
-            d = data.get("data") or {}
-            tours = d.get("tournaments") or []
-            page_events = [e for t in tours for e in (t.get("events") or [])]
-            if not page_events:
+
+            async def one(p, _sem=sem):
+                async with _sem:
+                    return p, await self._events_page(p)
+
+            results = await asyncio.gather(*[one(p) for p in wave])
+            self.requests_made += len(wave)
+            stop = False
+            for _p, res in sorted(results, key=lambda x: x[0]):
+                if not res:
+                    stop = True
+                    continue
+                d, pevents = res
+                for e in pevents:
+                    eid = e.get("eventId")
+                    if eid and eid not in seen:
+                        seen.add(eid)
+                        events.append(e)
+                if not d.get("moreEvents"):
+                    stop = True
+            if stop:
                 break
-            for e in page_events:
-                eid = e.get("eventId")
-                if eid and eid not in seen:
-                    seen.add(eid)
-                    events.append(e)
-            if not d.get("moreEvents"):
-                break
-            page += 1
+            pages += len(wave)
             await asyncio.sleep(SB_DELAY)
-        logger.info("SportyBet: fetched %s prematch events (%s pages)", len(events), page)
+        logger.info("SportyBet: fetched %s prematch events in %s bulk requests", len(events), self.requests_made)
         return events
 
     async def fetch_banned_events(self):
@@ -630,18 +687,35 @@ class SportyBet:
         return set()
 
     async def fetch_outcomes(self, items):
-        """items: list of {eventId, marketId, outcomeId, specifier}."""
+        """BULK fetch of outcomes for ALL matches in a handful of requests.
+
+        Pinnacle collects every market for every fixture from one bulk call
+        per tournament batch; the equivalent here is to send every
+        (eventId, marketId, outcomeId) triple in a small number of large
+        batched /Outcomes posts, run CONCURRENTLY - never one call per match.
+        """
         out = {}
-        for i in range(0, len(items), SB_OUTCOMES_BATCH):
-            batch = items[i:i + SB_OUTCOMES_BATCH]
-            data = await self._post(SB_OUTCOMES_PATH, batch)
-            if data and data.get("bizCode") == 10000:
-                for d in data.get("data") or []:
-                    eid = d.get("eventId")
-                    for m in d.get("markets") or []:
-                        for o in m.get("outcomes") or []:
-                            out[(eid, str(m.get("id")), str(o.get("id")))] = o
-            await asyncio.sleep(SB_DELAY)
+        if not items:
+            return out
+        chunks = [items[i:i + SB_OUTCOMES_BATCH]
+                  for i in range(0, len(items), SB_OUTCOMES_BATCH)]
+        sem = asyncio.Semaphore(max(1, SB_CONCURRENCY))
+
+        async def one(chunk, _sem=sem):
+            async with _sem:
+                return await self._post(SB_OUTCOMES_PATH, chunk)
+
+        results = await asyncio.gather(*[one(c) for c in chunks], return_exceptions=True)
+        self.requests_made += len(chunks)
+        self.outcome_requests += len(chunks)
+        for data in results:
+            if isinstance(data, Exception) or not data or data.get("bizCode") != 10000:
+                continue
+            for d in data.get("data") or []:
+                eid = d.get("eventId")
+                for m in d.get("markets") or []:
+                    for o in m.get("outcomes") or []:
+                        out[(eid, str(m.get("id")), str(o.get("id")))] = o
         return out
 
     async def close(self):
@@ -668,6 +742,8 @@ def sb_event_meta(e):
         "commence": iso_from_epoch_ms(e.get("estimateStartTime")),
         "status": e.get("status", 0),
         "match_status": e.get("matchStatus", ""),
+        "odds_drop": e.get("oddsDrop") or {},
+        "dr_count": e.get("drCount") or {},
     }
 
 
@@ -697,7 +773,40 @@ def sb_extract_list_markets(e, meta):
             o = outs.get(SB_O_DRAW)
             if o:
                 cands.append(_sb_cand(meta, mid, SB_O_DRAW, "HT Draw", o, "HT1X2"))
+        elif mid in (SB_M_CS, SB_M_HT_CS):
+            # SportyBet also ships the odd-dropping markets (CS, HT CS) inline
+            # in the events-list payload under the event's `oddsDrop` block.
+            # Harvest them here so the bulk /Outcomes call is only needed when
+            # the list omitted that market.
+            if not meta.get("odds_drop"):
+                continue
+            for oid, o in outs.items():
+                o = dict(o)
+                o["odds"] = _sb_dropped_odds(meta, mid, oid)
+                if mid == SB_M_CS:
+                    label = SB_CS_OUTCOMES.get(oid)
+                    if label:
+                        cands.append(_sb_cand(meta, mid, oid, label, o, "CS"))
+                else:
+                    label = SB_HT_CS_OUTCOMES.get(oid)
+                    if label:
+                        cands.append(_sb_cand(meta, mid, oid, label, o, "HTCS"))
     return cands
+
+
+def _sb_dropped_odds(meta, market_id, outcome_id):
+    """Resolve a dropped odd for a market carried inline in the events list.
+
+    SportyBet exposes its moving odds under the event's `oddsDrop` block keyed
+    by market id; when the key is absent the outcome's own `odds` is used, which
+    keeps the value identical to the /Outcomes payload.
+    """
+    block = (meta.get("odds_drop") or {}).get(str(market_id)) or {}
+    val = block.get(str(outcome_id))
+    try:
+        return float(val) if val is not None else 0.0
+    except Exception:
+        return 0.0
 
 
 def _sb_cand(meta, market_id, outcome_id, label, o, group):
@@ -780,6 +889,10 @@ def _set_fallback_markets():
     global D_MARKETS, GIFT_D_MARKETS
     global MARKET_H2H, MARKET_BTTS, MARKET_OVER15, MARKET_OVER25
     global MARKET_HT_H2H, MARKET_CS
+    # NOTE: MARKET_HT_H2H and MARKET_CS MUST be declared global in this function.
+    # They used to be assigned without the declaration, which raised
+    # UnboundLocalError and killed the Pinnacle scan - and the oddspapi key
+    # change - at start-up.
     if not MARKET_H2H:
         MARKET_H2H = 101
     if not MARKET_BTTS:
@@ -977,7 +1090,9 @@ async def save_gift_snapshots(cands):
 
 
 async def get_odds_snapshots(mkey, market_id, outcome_id, hours_back=SCAN_WINDOW_HOURS, source=None):
-    cutoff = (now_utc() - timedelta(hours=hours_back)).isoformat()
+    # Same 720-minute prematch look-back Pinnacle uses, so history[0] is the
+    # FIRST pre-match scan of the selection (not the previous scan).
+    cutoff = (now_utc() - timedelta(minutes=SCAN_WINDOW_MINUTES)).isoformat()
     params = {
         "match_key": f"eq.{mkey}",
         "market_id": f"eq.{market_id}",
@@ -992,7 +1107,8 @@ async def get_odds_snapshots(mkey, market_id, outcome_id, hours_back=SCAN_WINDOW
 
 
 async def get_gift_snapshots_past(mkey, market_id, outcome_id, hours_back=SCAN_WINDOW_HOURS, source=None):
-    cutoff = (now_utc() - timedelta(hours=hours_back)).isoformat()
+    # Same 720-minute prematch look-back Pinnacle uses.
+    cutoff = (now_utc() - timedelta(minutes=SCAN_WINDOW_MINUTES)).isoformat()
     params = {
         "match_key": f"eq.{mkey}",
         "market_id": f"eq.{market_id}",
@@ -1190,11 +1306,19 @@ async def run_cs_analysis(candidates, source, allowed, kind="cs"):
 # SPORTYBET SCAN ORCHESTRATION
 # ===========================================================================
 async def sportybet_collect():
-    """Fetch all prematch SportyBet candidates for the 24h window."""
+    """BULK collect of all prematch SportyBet candidates for the 24h window.
+
+    Mirrors Pinnacle's bulk pattern: the whole event list arrives in a few
+    batched, concurrent page requests, and the score markets - when the list
+    payload does not already carry them inline - are fetched in a couple of
+    large concurrent /Outcomes batches instead of one call per match.  The
+    scan logic, markets, filters and comparison are unchanged.
+    """
     events = await SB.fetch_all_events()
     banned = await SB.fetch_banned_events()
 
     list_cands = []
+    cs_cands, ht_cs_cands = [], []
     cs_events = []
     for e in events:
         meta = sb_event_meta(e)
@@ -1209,46 +1333,58 @@ async def sportybet_collect():
             continue
         if is_excluded_league(meta["tournament_name"]):
             continue
-        list_cands.extend(sb_extract_list_markets(e, meta))
+        for c in sb_extract_list_markets(e, meta):
+            grp = c.get("market_group")
+            if grp == "CS":
+                cs_cands.append(c)
+            elif grp == "HTCS":
+                ht_cs_cands.append(c)
+            else:
+                list_cands.append(c)
         cs_events.append(meta)
 
-    # Correct score + HT correct score via the Outcomes endpoint
+    # Bulk /Outcomes only for whichever score market the list payload omitted.
+    need_cs = not cs_cands
+    need_htcs = not ht_cs_cands
     items = []
-    for meta in cs_events:
-        for oid in SB_CS_IDS:
-            items.append({"eventId": meta["event_id"], "marketId": SB_M_CS, "outcomeId": oid, "specifier": None})
-        for oid in SB_HT_CS_IDS:
-            items.append({"eventId": meta["event_id"], "marketId": SB_M_HT_CS, "outcomeId": oid, "specifier": None})
+    if cs_events and (need_cs or need_htcs):
+        for meta in cs_events:
+            if need_cs:
+                for oid in SB_CS_IDS:
+                    items.append({"eventId": meta["event_id"], "marketId": SB_M_CS, "outcomeId": oid, "specifier": None})
+            if need_htcs:
+                for oid in SB_HT_CS_IDS:
+                    items.append({"eventId": meta["event_id"], "marketId": SB_M_HT_CS, "outcomeId": oid, "specifier": None})
 
-    outcomes = await SB.fetch_outcomes(items) if items else {}
-    meta_by_id = {m["event_id"]: m for m in cs_events}
-
-    cs_cands, ht_cs_cands = [], []
-    for (eid, mid, oid), o in outcomes.items():
-        meta = meta_by_id.get(eid)
-        if not meta:
-            continue
-        try:
-            odds = float(o.get("odds") or 0)
-        except Exception:
-            odds = 0.0
-        if odds < 1.01 or not int(o.get("isActive", 1) or 0):
-            continue
-        if mid == SB_M_CS:
-            label = SB_CS_OUTCOMES.get(oid)
-            # Filter at collection time too: only Pinnacle's allowed scores.
-            if not label or label not in ALLOWED_CS:
+    if items:
+        outcomes = await SB.fetch_outcomes(items)
+        meta_by_id = {m["event_id"]: m for m in cs_events}
+        for (eid, mid, oid), o in outcomes.items():
+            meta = meta_by_id.get(eid)
+            if not meta:
                 continue
-            cs_cands.append(_sb_cand(meta, mid, oid, label, o, "CS"))
-        elif mid == SB_M_HT_CS:
-            label = SB_HT_CS_OUTCOMES.get(oid)
-            if not label or label not in HTCS_ALLOWED:
+            try:
+                odds = float(o.get("odds") or 0)
+            except Exception:
+                odds = 0.0
+            if odds < 1.01 or not int(o.get("isActive", 1) or 0):
                 continue
-            ht_cs_cands.append(_sb_cand(meta, mid, oid, label, o, "HTCS"))
+            if mid == SB_M_CS and need_cs:
+                label = SB_CS_OUTCOMES.get(oid)
+                # Filter at collection time too: only Pinnacle's allowed scores.
+                if not label or label not in ALLOWED_CS:
+                    continue
+                cs_cands.append(_sb_cand(meta, mid, oid, label, o, "CS"))
+            elif mid == SB_M_HT_CS and need_htcs:
+                label = SB_HT_CS_OUTCOMES.get(oid)
+                if not label or label not in HTCS_ALLOWED:
+                    continue
+                ht_cs_cands.append(_sb_cand(meta, mid, oid, label, o, "HTCS"))
 
     logger.info(
-        "SportyBet candidates: list=%s cs=%s ht_cs=%s",
-        len(list_cands), len(cs_cands), len(ht_cs_cands),
+        "SportyBet bulk scan: events=%s list=%s cs=%s ht_cs=%s http_requests=%s",
+        len(cs_events), len(list_cands), len(cs_cands), len(ht_cs_cands),
+        getattr(SB, "requests_made", "?"),
     )
     return list_cands, cs_cands, ht_cs_cands
 
