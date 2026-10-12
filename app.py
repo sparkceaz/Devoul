@@ -306,9 +306,28 @@ ODDS_LIMITS = {
     "htcs":    {"max_initial": HTCS_MAX_ODDS,            "max_current": None},
 }
 
+# Per-score initial-odds-before-drop limits for the correct-score market,
+# extracted VERBATIM from the current devoul.py (CS_ODDS_LIMIT).  A score is
+# only considered when its FIRST pre-match odds are at or below its own limit;
+# None means "no limit".  SportyBet uses this exact same table, because it runs
+# through the same run_cs_analysis() with kind="cs".
+CS_ODDS_LIMIT = {
+    "0:0": 16, "1:0": 12, "0:1": 12,
+    "1:1": 10, "2:0": 10, "0:2": 10,
+    "2:1": 15, "1:2": 15, "3:0": 15,
+    "0:3": 15, "1:3": 16, "3:1": 16,
+    "2:2": 16, "3:3": None,   # no limit
+}
 
-def passes_odds_limit(kind, original_odds, current_odds):
-    """Apply the per-market odds-limit filter (identical for both books)."""
+
+def passes_odds_limit(kind, original_odds, current_odds, score=None):
+    """Apply the per-market odds-limit filter (identical for both books).
+
+    For the correct-score market (``kind == "cs"``) the per-score
+    initial-odds-before-drop limit from CS_ODDS_LIMIT is applied on top of the
+    generic limits, exactly as the current devoul.py does.  ``score`` is the
+    outcome label (e.g. "1:0"); when omitted the per-score check is skipped.
+    """
     lim = ODDS_LIMITS.get(kind, {})
     mi = lim.get("max_initial")
     mc = lim.get("max_current")
@@ -318,6 +337,10 @@ def passes_odds_limit(kind, original_odds, current_odds):
         return False
     if mc is not None and current_odds > mc:
         return False
+    if kind == "cs" and score is not None:
+        score_limit = CS_ODDS_LIMIT.get(score)
+        if score_limit is not None and original_odds > score_limit:
+            return False
     return True
 
 
@@ -1282,7 +1305,10 @@ async def run_cs_analysis(candidates, source, allowed, kind="cs"):
             continue
         original = float(past[0]["odds"])
         current = float(c["odds"])
-        if not passes_odds_limit(kind, original, current):
+        # Per-market initial-odds-before-drop limit.  For the correct-score
+        # market this also applies the per-score CS_ODDS_LIMIT (e.g. 1:0 <= 12),
+        # so SportyBet obeys exactly the same rules as Pinnacle.
+        if not passes_odds_limit(kind, original, current, score=c["outcome_name"]):
             continue
         drop = ((original - current) / original) * 100
         if drop < MIN_DROP_PCT:
@@ -2055,19 +2081,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _dispatch_secret(update, parsed)
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback text handler (non-command, non-menu)."""
-    if not update.effective_user or not update.message:
-        return
-    uid = update.effective_user.id
-    if uid != ADMIN_ID:
-        await deny(update)
-        return
-    parsed = parse_secret((update.message.text or "").strip())
-    if parsed:
-        await _dispatch_secret(update, parsed)
-
-
 async def _dispatch_secret(update, parsed):
     kind, start, end = parsed["kind"], parsed["start"], parsed["end"]
 
@@ -2220,8 +2233,12 @@ def build_app():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CallbackQueryHandler(handle_callbacks))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text), group=1)
+    # ONE text handler only.  Registering a second handler for the same filter
+    # (the old group=1 handle_text) made every secret text fire TWICE, because
+    # both handlers called _dispatch_secret for the same update.  handle_buttons
+    # already covers the menu AND the secret texts, so it is the single entry
+    # point for all non-command text.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     return app
 
 
