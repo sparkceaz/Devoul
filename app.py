@@ -280,7 +280,7 @@ GIFT_D_MARKETS = []
 
 ALLOWED_CS = {
     "0:0", "1:0", "0:1", "1:1", "0:2", "1:2",
-    "2:0", "2:1", "2:2", "3:0", "0:3", "1:3", "3:1", "3:3",
+    "2:0", "2:1", "2:2", "3:0", "0:3", "1:3", "3:1",
 }
 
 # ---------------------------------------------------------------------------
@@ -316,7 +316,7 @@ CS_ODDS_LIMIT = {
     "1:1": 10, "2:0": 10, "0:2": 10,
     "2:1": 15, "1:2": 15, "3:0": 15,
     "0:3": 15, "1:3": 16, "3:1": 16,
-    "2:2": 16, "3:3": None,   # no limit
+    "2:2": 16,
 }
 
 
@@ -808,7 +808,7 @@ def sb_extract_list_markets(e, meta):
                 o["odds"] = _sb_dropped_odds(meta, mid, oid)
                 if mid == SB_M_CS:
                     label = SB_CS_OUTCOMES.get(oid)
-                    if label:
+                    if label and label in ALLOWED_CS:
                         cands.append(_sb_cand(meta, mid, oid, label, o, "CS"))
                 else:
                     label = SB_HT_CS_OUTCOMES.get(oid)
